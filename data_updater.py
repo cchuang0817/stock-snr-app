@@ -1,7 +1,7 @@
 # data_updater.py
 import pandas as pd
 import yfinance as yf
-import requests, time, os, glob
+import requests, time, os, glob, argparse, sys
 from pathlib import Path
 import datetime as dt
 
@@ -87,9 +87,16 @@ def pull_fundamentals(ticker: str) -> dict:
         "lastPrice": fast.get("last_price") or info.get("currentPrice"),
     }
 
-def fetch_history(ticker: str, days: int = 420) -> pd.DataFrame:
-    df = yf.download(ticker, period=f"{int(days)}d", interval="1d",
-                     auto_adjust=True, progress=False, threads=False, group_by="ticker")
+def fetch_history_upto(ticker: str, end_date: dt.date, lookback_days: int = 420) -> pd.DataFrame:
+    """
+    取得 end_date(含) 之前的日線：用 start/end 指定範圍，避免抓到更晚日期。
+    """
+    end_plus = end_date + dt.timedelta(days=1)  # yfinance end 為「不含此日」，故 +1
+    start = end_plus - dt.timedelta(days=lookback_days)
+    df = yf.download(
+        ticker, start=start.strftime("%Y-%m-%d"), end=end_plus.strftime("%Y-%m-%d"),
+        interval="1d", auto_adjust=True, progress=False, threads=False, group_by="ticker"
+    )
     if df is None or df.empty: return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
         try:
@@ -113,13 +120,25 @@ def compute_snr(df: pd.DataFrame, window_days: int = 120):
     })
     return out
 
-# ---------- 3) 主流程（自動用最近交易日；抓不到就沿用上一版） ----------
+# ---------- 3) 主流程（支援 target-date；無則抓最近交易日；抓不到沿用上一版） ----------
 def main():
+    # 解析 target-date（環境變數或 CLI）
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--target-date", type=str, default=None, help="指定資料日期 YYYY-MM-DD（含該日，假日會自動用上個交易日）")
+    args = parser.parse_args()
+    target_str = args.target_date or os.getenv("TARGET_DATE")
+    target_date = None
+    if target_str:
+        try:
+            target_date = dt.datetime.strptime(target_str, "%Y-%m-%d").date()
+        except ValueError:
+            log(f"ERROR target-date 格式錯誤：{target_str}，應為 YYYY-MM-DD")
+            sys.exit(1)
+
     tickers_df = fetch_tw_tickers()
     if tickers_df.empty or len(tickers_df) < 100:
         log("ERROR 代碼清單為空或過少；改用上一版資料做備援。")
-        use_previous_as_fallback()
-        return
+        return use_previous_as_fallback()
 
     tickers = tickers_df["yahoo"].tolist()
 
@@ -132,17 +151,25 @@ def main():
     fund_df = pd.DataFrame(fund_rows)
     if fund_df.empty:
         log("ERROR 基本面為空；改用上一版資料做備援。")
-        use_previous_as_fallback()
-        return
+        return use_previous_as_fallback()
 
-    # ---- SNR & 最近交易日 ----
+    # ---- SNR & 最近交易日 / 目標日期 ----
     snr_rows, last_dates = [], []
     for i, t in enumerate(tickers, 1):
         try:
-            hist = fetch_history(t, 420)
+            if target_date:
+                hist = fetch_history_upto(t, end_date=target_date, lookback_days=420)
+            else:
+                # 未指定則抓到今天，等下用實際最後日期決定 file_date
+                hist = fetch_history_upto(t, end_date=dt.date.today(), lookback_days=420)
             if hist.empty: 
                 continue
-            last_dates.append(pd.to_datetime(hist["Date"].iloc[-1]).date())
+            # 這支的最後日期
+            last_dt = pd.to_datetime(hist["Date"].iloc[-1]).date()
+            if target_date and last_dt > target_date:
+                # 理論上不會發生（已用 end 限制），但保險
+                last_dt = target_date
+            last_dates.append(last_dt)
             snr = compute_snr(hist, 120)
             if snr is None or snr.dropna().empty:
                 continue
@@ -160,12 +187,12 @@ def main():
         if i % 50 == 0: time.sleep(1)
 
     if not last_dates or not snr_rows:
-        log("ERROR 今天抓不到任何 SNR/歷史日線；改用上一版資料做備援。")
-        use_previous_as_fallback()
-        return
+        log("ERROR 抓不到任何 SNR/歷史日線；改用上一版資料做備援。")
+        return use_previous_as_fallback()
 
-    file_date = max(last_dates).isoformat()   # 最近交易日
-    log(f"INFO 最近交易日：{file_date}")
+    # 檔名日期：若有指定 target-date → 用 target；否則用「實際抓到的最大日期」（最近交易日）
+    file_date = (target_date or max(last_dates)).isoformat()
+    log(f"INFO 檔案日期：{file_date}")
 
     # 寫檔（覆蓋 parquet、另存對應日期 csv）
     fund_df["asOfDate"] = file_date
@@ -177,7 +204,7 @@ def main():
     snr_df["asOfDate"] = file_date
     snr_df.to_parquet(DATA_DIR / "snr_summary.parquet", index=False)
     snr_df.to_csv(DATA_DIR / f"snr_summary_{file_date}.csv", index=False, encoding="utf-8-sig")
-    log(f"OK snr_summary：{len(snr_df)} 列")
+    log(f"OK snr_summary：{len(snr_df)} 列（最後日期：{file_date}）")
 
 def use_previous_as_fallback():
     """抓不到新資料時：沿用 data 目錄裡最新的一組檔案，重新覆蓋 parquet，保證前端可用。"""
