@@ -3,3 +3,4 @@ streamlit
 yfinance
 pandas
 matplotlib
+pyarrow
