@@ -1,19 +1,49 @@
-
 import streamlit as st
 import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
-import math, os
+import math, os, glob
 
-st.set_page_config(page_title="看股空間｜全市場 + 產業篩選（繁中）", layout="wide")
+st.set_page_config(page_title="看股空間｜全市場 + 產業篩選（每日資料庫）", layout="wide")
 
 DATA_FUND = "data/fundamentals.parquet"
-DATA_SNR = "data/snr_summary.parquet"
+DATA_SNR  = "data/snr_summary.parquet"
 
-# -------- 基本工具 --------
+# ---------- 資料庫讀取（Parquet 優先，失敗改用 CSV 最新檔） ----------
 @st.cache_data(ttl=60*30)
-def 取得歷史價(ticker: str, days: int = 365) -> pd.DataFrame:
-    df = yf.download(ticker, period=f"{int(days)}d", interval="1d", auto_adjust=True, progress=False, threads=False, group_by="ticker")
+def load_db():
+    fund_df = snr_df = None
+    # Parquet
+    if os.path.exists(DATA_FUND):
+        try:
+            fund_df = pd.read_parquet(DATA_FUND)
+            st.info("已載入資料庫：fundamentals.parquet")
+        except Exception as e:
+            st.warning(f"讀取 fundamentals.parquet 失敗：{e}")
+    if os.path.exists(DATA_SNR):
+        try:
+            snr_df = pd.read_parquet(DATA_SNR)
+            st.info("已載入資料庫：snr_summary.parquet")
+        except Exception as e:
+            st.warning(f"讀取 snr_summary.parquet 失敗：{e}")
+    # CSV 後援
+    if fund_df is None or fund_df.empty:
+        csvs = sorted(glob.glob("data/fundamentals_*.csv"))
+        if csvs:
+            fund_df = pd.read_csv(csvs[-1])
+            st.info(f"已改用 CSV：{csvs[-1]}")
+    if snr_df is None or snr_df.empty:
+        csvs = sorted(glob.glob("data/snr_summary_*.csv"))
+        if csvs:
+            snr_df = pd.read_csv(csvs[-1])
+            st.info(f"已改用 CSV：{csvs[-1]}")
+    return fund_df, snr_df
+
+# ---------- 即時工具：SNR ----------
+@st.cache_data(ttl=60*30)
+def fetch_history(ticker: str, days: int = 365) -> pd.DataFrame:
+    df = yf.download(ticker, period=f"{int(days)}d", interval="1d", auto_adjust=True,
+                     progress=False, threads=False, group_by="ticker")
     if df is None or df.empty:
         return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
@@ -26,32 +56,28 @@ def 取得歷史價(ticker: str, days: int = 365) -> pd.DataFrame:
     df = df.rename_axis("日期").reset_index()
     return df.dropna(subset=["Close"])
 
-def 計算SNR(df: pd.DataFrame, 視窗天數: int = 120):
+def compute_snr(df: pd.DataFrame, window: int = 120):
     if df.empty or "Close" not in df.columns:
         return df.assign(支撐=pd.NA, 中位=pd.NA, 壓力=pd.NA)
-    close = df["Close"]
-    roll = close.rolling(視窗天數, min_periods=max(20, 視窗天數//4))
+    roll = df["Close"].rolling(window, min_periods=max(20, window//4))
     out = df.copy()
     out["支撐"] = roll.quantile(0.20)
     out["中位"] = roll.quantile(0.50)
     out["壓力"] = roll.quantile(0.80)
     return out
 
-def 建議文字(收盤: float, 支撐: float, 壓力: float, 近距比例: float = 0.03):
-    if any(pd.isna(x) for x in (收盤, 支撐, 壓力)):
+def suggest(last_close, S, R, near=0.03):
+    import pandas as pd
+    if any(pd.isna(x) for x in (last_close, S, R)):
         return "資料不足"
-    距支撐 = (收盤 - 經濟 if False else (收盤 - 支撐)) / 支撐 if 支撐 else math.inf
-    距壓力 = (壓力 - 收盤) / 壓力 if 壓力 else math.inf
-    if 距支撐 <= 近距比例:
-        return "接近支撐：偏多、可分批佈局"
-    if 距壓力 <= 近距比例:
-        return "接近壓力：保守、等待回檔"
-    if 收盤 < (支撐 + 壓力) / 2:
-        return "區間下半：偏多但勿追高"
-    else:
-        return "區間上半：觀望或逢高減碼"
+    dS = (last_close - S) / S if S else math.inf
+    dR = (R - last_close) / R if R else math.inf
+    if dS <= near: return "接近支撐：偏多、可分批佈局"
+    if dR <= near: return "接近壓力：保守、等待回檔"
+    if last_close < (S + R) / 2: return "區間下半：偏多但勿追高"
+    return "區間上半：觀望或逢高減碼"
 
-def 加總評分(df: pd.DataFrame):
+def score_frame(df: pd.DataFrame):
     def rank(s: pd.Series, asc=True):
         r = s.rank(method="average", ascending=asc, na_option="keep")
         if r.isna().all(): return pd.Series([float("nan")] * len(s), index=s.index)
@@ -75,93 +101,80 @@ def 加總評分(df: pd.DataFrame):
     score["total_score"] = 0.40*score["估值分數"] + 0.35*score["品質分數"] + 0.25*score["成長分數"]
     return pd.concat([df, score], axis=1)
 
-# -------- 介面 --------
+# ---------- UI ----------
 st.title("看股空間｜全市場 + 產業篩選（每日資料庫）")
 st.caption("每日台北時間 18:30 自動更新資料庫（GitHub Actions）。頁面優先讀資料庫，無庫時改即時計算。")
 
-# 載入資料庫
-fund_df, snr_df = None, None
-if os.path.exists(DATA_FUND):
-    fund_df = pd.read_parquet(DATA_FUND)
-if os.path.exists(DATA_SNR):
-    snr_df = pd.read_parquet(DATA_SNR)
+fund_df, snr_df = load_db()
 
-左, 右 = st.columns([3,2], gap="large")
+colL, colR = st.columns([3,2], gap="large")
 
-with 左:
-    if fund_df is not None and not fund_df.empty:
-        sectors = sorted(set(str(x) for x in fund_df["sector"].dropna().unique()))
-        industries = sorted(set(str(x) for x in fund_df["industry"].dropna().unique()))
+with colL:
+    if fund_df is None or fund_df.empty:
+        st.warning("資料庫不存在，將使用即時模式。請稍後或檢查 GitHub Actions。")
+    else:
+        sectors   = sorted(set(str(x) for x in fund_df["sector"].dropna().unique()))
+        industries= sorted(set(str(x) for x in fund_df["industry"].dropna().unique()))
         st.subheader("篩選條件")
-        產業類別 = st.selectbox("選擇產業（不選代表全部）", ["全部"] + sectors + industries, index=0)
-        TopN = st.number_input("Top-N（精選數量）", min_value=1, max_value=100, value=5, step=1)
-        SNR視窗 = st.slider("SNR 視窗（天）", min_value=60, max_value=240, value=120, step=10)
-        近距百分比 = st.slider("接近支撐/壓力判定（%）", min_value=1, max_value=10, value=3, step=1) / 100.0
+        pick = st.selectbox("選擇產業（不選代表全部）", ["全部"] + sectors + industries, index=0)
+        topn = st.number_input("Top-N（精選數量）", min_value=1, max_value=100, value=5, step=1)
+        win  = st.slider("SNR 視窗（天）", min_value=60, max_value=240, value=120, step=10)
+        near = st.slider("接近支撐/壓力判定（%）", min_value=1, max_value=10, value=3, step=1) / 100.0
 
         df = fund_df.copy()
-        if 產業類別 != "全部":
-            mask = df[["sector","industry","shortName"]].astype(str).apply(lambda s: s.str.contains(產業類別, case=False, na=False))
+        if pick != "全部":
+            mask = df[["sector","industry","shortName"]].astype(str).apply(lambda s: s.str.contains(pick, case=False, na=False))
             df = df[mask.any(axis=1)]
         if df.empty:
             st.warning("沒有符合條件的股票。")
         else:
-            scored = 加總評分(df).sort_values("total_score", ascending=False)
+            scored = score_frame(df).sort_values("total_score", ascending=False)
+            show_cols = ["Ticker","shortName","sector","industry","trailingPE","priceToBook",
+                         "returnOnEquity","grossMargins","operatingMargins","revenueGrowth","earningsGrowth",
+                         "total_score"]
             st.markdown("**排名表（依總分）**")
-            show_cols = ["Ticker","shortName","sector","industry","trailingPE","priceToBook","returnOnEquity","grossMargins","operatingMargins","revenueGrowth","earningsGrowth","total_score"]
             st.dataframe(scored[show_cols], use_container_width=True, height=360)
-            picks = scored.head(TopN)
 
+            picks = scored.head(topn)
             st.markdown("---")
             st.markdown("### Top-N 的 SNR 圖與建議")
             for t in picks["Ticker"].tolist():
-                # 若有 SNR 資料庫，可直接顯示近況；同時現算圖
+                # 若資料庫有 SNR 概況則先顯示
                 if snr_df is not None and not snr_df.empty:
                     row = snr_df[snr_df["Ticker"] == t].tail(1)
                     if not row.empty:
-                        last_date = row["LastDate"].iloc[0]
-                        close = row["Close"].iloc[0]
-                        s = row["S"].iloc[0]; r = row["R"].iloc[0]
-                        st.markdown(f"**{t}**｜{last_date}｜現價：{round(float(close),2)}｜建議：{row['Suggestion'].iloc[0]}")
-
-                # 畫 SNR 圖（僅 Top-N 即時計算，不會太慢）
-                hist = 取得歷史價(t, 365)
+                        st.markdown(f"**{t}**｜{row['LastDate'].iloc[0]}｜現價：{round(float(row['Close'].iloc[0]),2)}｜建議：{row['Suggestion'].iloc[0]}")
+                # 畫 SNR 圖（即時算 Top-N，不會太慢）
+                hist = fetch_history(t, 365)
                 if hist.empty:
                     st.warning(f"{t} 無法取得歷史資料")
                     continue
-                snr = 計算SNR(hist, SNR視窗)
-                # 畫圖
+                snr = compute_snr(hist, win)
                 fig, ax = plt.subplots(figsize=(8, 4))
                 ax.plot(snr["日期"], snr["Close"], label="收盤")
                 ax.plot(snr["日期"], snr["支撐"], linestyle="--", label="支撐(20%)")
                 ax.plot(snr["日期"], snr["中位"], linestyle="--", label="中位(50%)")
                 ax.plot(snr["日期"], snr["壓力"], linestyle="--", label="壓力(80%)")
-                ax.set_title(f"{t} 的 SNR")
-                ax.set_xlabel("日期"); ax.set_ylabel("價格"); ax.legend()
+                ax.set_title(f"{t} 的 SNR"); ax.set_xlabel("日期"); ax.set_ylabel("價格"); ax.legend()
                 st.pyplot(fig)
-    else:
-        st.info("資料庫不存在，將使用即時模式。請稍後或先於 GitHub Actions 建立資料庫。")
 
-with 右:
+with colR:
     st.subheader("單檔查詢（即時）")
     q = st.text_input("輸入股票代碼（台股 .TW/.TWO，例如 2330.TW）", "2330.TW")
     if st.button("查詢"):
-        hist = 取得歷史價(q, 365)
+        hist = fetch_history(q, 365)
         if hist.empty:
             st.error("抓不到資料，請檢查代碼或稍後再試。")
         else:
-            snr = 計算SNR(hist, 120)
+            snr = compute_snr(hist, 120)
             last = snr.dropna(subset=["Close"]).iloc[-1]
-            # 建議
-            dS = (last["Close"] - last.get("支撐")) / last.get("支撐") if pd.notna(last.get("支撐")) else None
-            dR = (last.get("壓力") - last["Close"]) / last.get("壓力") if pd.notna(last.get("壓力")) else None
             st.markdown(f"**{q}**｜{last['日期'].date()}｜現價：{round(float(last['Close']),2)}")
             fig, ax = plt.subplots(figsize=(8, 4))
             ax.plot(snr["日期"], snr["Close"], label="收盤")
             ax.plot(snr["日期"], snr["支撐"], linestyle="--", label="支撐(20%)")
             ax.plot(snr["日期"], snr["中位"], linestyle="--", label="中位(50%)")
             ax.plot(snr["日期"], snr["壓力"], linestyle="--", label="壓力(80%)")
-            ax.set_title(f"{q} 的 SNR")
-            ax.set_xlabel("日期"); ax.set_ylabel("價格"); ax.legend()
+            ax.set_title(f"{q} 的 SNR"); ax.set_xlabel("日期"); ax.set_ylabel("價格"); ax.legend()
             st.pyplot(fig)
 
 st.caption("免責聲明：本工具僅供研究與教育用途，非投資建議。")
