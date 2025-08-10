@@ -1,7 +1,7 @@
 # data_updater.py
 import pandas as pd
 import yfinance as yf
-import requests, time, os, glob, argparse, sys
+import requests, time, os, glob, sys
 from pathlib import Path
 import datetime as dt
 
@@ -15,8 +15,8 @@ HEADERS = {
 
 def log(msg): print(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-# ---------- 1) 台股代碼（上市/上櫃） ----------
-def fetch_tw_tickers(retries=3, sleep_sec=3) -> pd.DataFrame:
+# ---------------- 代碼清單（上市/上櫃） ----------------
+def fetch_tw_tickers(retries=3, sleep_sec=2) -> pd.DataFrame:
     urls = [
         "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2",  # 上市
         "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4",  # 上櫃
@@ -27,7 +27,11 @@ def fetch_tw_tickers(retries=3, sleep_sec=3) -> pd.DataFrame:
         for _ in range(retries):
             try:
                 html = requests.get(u, headers=HEADERS, timeout=30).text
-                tables = pd.read_html(html)
+                # 先用 lxml，失敗再用 bs4/html5lib
+                try:
+                    tables = pd.read_html(html)
+                except Exception:
+                    tables = pd.read_html(html, flavor="bs4")
                 if tables:
                     frames.append(tables[0]); ok = True; break
             except Exception as e:
@@ -56,12 +60,13 @@ def fetch_tw_tickers(retries=3, sleep_sec=3) -> pd.DataFrame:
     out["yahoo"] = out["code"] + out["market"].apply(suffix)
     out = out[["code","name","market","yahoo"]].drop_duplicates()
 
+    # 存一份代碼偵錯檔
     today = dt.date.today().isoformat()
     out.to_csv(DATA_DIR / f"tickers_{today}.csv", index=False, encoding="utf-8-sig")
     log(f"INFO 台股代碼數：{len(out)}")
     return out
 
-# ---------- 2) yfinance 幫手 ----------
+# ---------------- yfinance 幫手 ----------------
 def pull_fundamentals(ticker: str) -> dict:
     t = yf.Ticker(ticker)
     info, fast = {}, {}
@@ -88,14 +93,18 @@ def pull_fundamentals(ticker: str) -> dict:
     }
 
 def fetch_history_upto(ticker: str, end_date: dt.date, lookback_days: int = 420) -> pd.DataFrame:
-    """
-    取得 end_date(含) 之前的日線：用 start/end 指定範圍，避免抓到更晚日期。
-    """
-    end_plus = end_date + dt.timedelta(days=1)  # yfinance end 為「不含此日」，故 +1
+    """抓 end_date(含) 以前的日線，避免抓到未來或空白日。"""
+    end_plus = end_date + dt.timedelta(days=1)  # yfinance end 是不含此日
     start = end_plus - dt.timedelta(days=lookback_days)
     df = yf.download(
-        ticker, start=start.strftime("%Y-%m-%d"), end=end_plus.strftime("%Y-%m-%d"),
-        interval="1d", auto_adjust=True, progress=False, threads=False, group_by="ticker"
+        ticker,
+        start=start.strftime("%Y-%m-%d"),
+        end=end_plus.strftime("%Y-%m-%d"),
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+        threads=False,
+        group_by="ticker",
     )
     if df is None or df.empty: return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
@@ -120,21 +129,31 @@ def compute_snr(df: pd.DataFrame, window_days: int = 120):
     })
     return out
 
-# ---------- 3) 主流程（支援 target-date；無則抓最近交易日；抓不到沿用上一版） ----------
-def main():
-    # 解析 target-date（環境變數或 CLI）
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--target-date", type=str, default=None, help="指定資料日期 YYYY-MM-DD（含該日，假日會自動用上個交易日）")
-    args = parser.parse_args()
-    target_str = args.target_date or os.getenv("TARGET_DATE")
-    target_date = None
-    if target_str:
-        try:
-            target_date = dt.datetime.strptime(target_str, "%Y-%m-%d").date()
-        except ValueError:
-            log(f"ERROR target-date 格式錯誤：{target_str}，應為 YYYY-MM-DD")
-            sys.exit(1)
+# ---------------- 主流程：最近交易日＋備援 ----------------
+def use_previous_as_fallback():
+    """抓不到新資料時：沿用 data/ 最新一組 CSV 覆蓋 parquet，讓前端可用。"""
+    prev_f = sorted(glob.glob("data/fundamentals_*.csv"))
+    prev_s = sorted(glob.glob("data/snr_summary_*.csv"))
+    if not prev_f or not prev_s:
+        log("FATAL 沒有可用的舊檔可沿用。")
+        return
+    fund_csv = prev_f[-1]; snr_csv = prev_s[-1]
+    fund_df = pd.read_csv(fund_csv); snr_df = pd.read_csv(snr_csv)
+    # 從檔名取日期
+    try:
+        file_date = os.path.basename(snr_csv).split("_")[-1].replace(".csv","")
+    except Exception:
+        file_date = dt.date.today().isoformat()
+    fund_df["asOfDate"] = file_date
+    snr_df["asOfDate"] = file_date
+    try:
+        fund_df.to_parquet(DATA_DIR / "fundamentals.parquet", index=False)
+        snr_df.to_parquet(DATA_DIR / "snr_summary.parquet", index=False)
+    except Exception as e:
+        log(f"WARN 無法寫 parquet：{e}（沿用 CSV 即可）")
+    log(f"OK 使用上一版覆蓋 parquet：{file_date}（fund={len(fund_df)}、snr={len(snr_df)}）")
 
+def main():
     tickers_df = fetch_tw_tickers()
     if tickers_df.empty or len(tickers_df) < 100:
         log("ERROR 代碼清單為空或過少；改用上一版資料做備援。")
@@ -142,7 +161,7 @@ def main():
 
     tickers = tickers_df["yahoo"].tolist()
 
-    # ---- 基本面 ----
+    # 基本面
     fund_rows = []
     for i, t in enumerate(tickers, 1):
         try: fund_rows.append(pull_fundamentals(t))
@@ -153,22 +172,15 @@ def main():
         log("ERROR 基本面為空；改用上一版資料做備援。")
         return use_previous_as_fallback()
 
-    # ---- SNR & 最近交易日 / 目標日期 ----
+    # SNR + 最近交易日
     snr_rows, last_dates = [], []
+    today = dt.date.today()
     for i, t in enumerate(tickers, 1):
         try:
-            if target_date:
-                hist = fetch_history_upto(t, end_date=target_date, lookback_days=420)
-            else:
-                # 未指定則抓到今天，等下用實際最後日期決定 file_date
-                hist = fetch_history_upto(t, end_date=dt.date.today(), lookback_days=420)
+            hist = fetch_history_upto(t, end_date=today, lookback_days=420)
             if hist.empty: 
                 continue
-            # 這支的最後日期
             last_dt = pd.to_datetime(hist["Date"].iloc[-1]).date()
-            if target_date and last_dt > target_date:
-                # 理論上不會發生（已用 end 限制），但保險
-                last_dt = target_date
             last_dates.append(last_dt)
             snr = compute_snr(hist, 120)
             if snr is None or snr.dropna().empty:
@@ -187,44 +199,29 @@ def main():
         if i % 50 == 0: time.sleep(1)
 
     if not last_dates or not snr_rows:
-        log("ERROR 抓不到任何 SNR/歷史日線；改用上一版資料做備援。")
+        log("ERROR 今天抓不到任何 SNR/歷史日線；改用上一版資料做備援。")
         return use_previous_as_fallback()
 
-    # 檔名日期：若有指定 target-date → 用 target；否則用「實際抓到的最大日期」（最近交易日）
-    file_date = (target_date or max(last_dates)).isoformat()
-    log(f"INFO 檔案日期：{file_date}")
+    file_date = max(last_dates).isoformat()   # 最近交易日
+    log(f"INFO 最近交易日：{file_date}")
 
     # 寫檔（覆蓋 parquet、另存對應日期 csv）
     fund_df["asOfDate"] = file_date
-    fund_df.to_parquet(DATA_DIR / "fundamentals.parquet", index=False)
+    try:
+        fund_df.to_parquet(DATA_DIR / "fundamentals.parquet", index=False)
+    except Exception as e:
+        log(f"WARN 無法寫 fundamentals.parquet：{e}")
     fund_df.to_csv(DATA_DIR / f"fundamentals_{file_date}.csv", index=False, encoding="utf-8-sig")
     log(f"OK fundamentals：{len(fund_df)} 列")
 
     snr_df = pd.DataFrame(snr_rows)
     snr_df["asOfDate"] = file_date
-    snr_df.to_parquet(DATA_DIR / "snr_summary.parquet", index=False)
-    snr_df.to_csv(DATA_DIR / f"snr_summary_{file_date}.csv", index=False, encoding="utf-8-sig")
-    log(f"OK snr_summary：{len(snr_df)} 列（最後日期：{file_date}）")
-
-def use_previous_as_fallback():
-    """抓不到新資料時：沿用 data 目錄裡最新的一組檔案，重新覆蓋 parquet，保證前端可用。"""
-    prev_f = sorted(glob.glob("data/fundamentals_*.csv"))
-    prev_s = sorted(glob.glob("data/snr_summary_*.csv"))
-    if not prev_f or not prev_s:
-        log("FATAL 沒有可用的舊檔可沿用，結束（前端會顯示即時模式）。")
-        return
-    fund_csv = prev_f[-1]; snr_csv = prev_s[-1]
-    fund_df = pd.read_csv(fund_csv); snr_df = pd.read_csv(snr_csv)
-    # 從檔名取日期
     try:
-        file_date = os.path.basename(snr_csv).split("_")[-1].replace(".csv","")
-    except Exception:
-        file_date = dt.date.today().isoformat()
-    fund_df["asOfDate"] = file_date
-    snr_df["asOfDate"] = file_date
-    fund_df.to_parquet(DATA_DIR / "fundamentals.parquet", index=False)
-    snr_df.to_parquet(DATA_DIR / "snr_summary.parquet", index=False)
-    log(f"OK 使用上一版檔案覆蓋 parquet：{file_date}（fund={len(fund_df)}、snr={len(snr_df)}）")
+        snr_df.to_parquet(DATA_DIR / "snr_summary.parquet", index=False)
+    except Exception as e:
+        log(f"WARN 無法寫 snr_summary.parquet：{e}")
+    snr_df.to_csv(DATA_DIR / f"snr_summary_{file_date}.csv", index=False, encoding="utf-8-sig")
+    log(f"OK snr_summary：{len(snr_df)} 列")
 
 if __name__ == "__main__":
     main()
