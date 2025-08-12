@@ -1,9 +1,16 @@
 # data_updater.py
 import pandas as pd
 import yfinance as yf
-import requests, time, os, glob, sys
+import requests, time, os, glob
 from pathlib import Path
 import datetime as dt
+
+from fetch_industry_and_sectors import (
+    update_industry_map,
+    attach_industry_to_fundamentals,
+    compute_sector_performance,
+    save_sector_performance,
+)
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -15,7 +22,7 @@ HEADERS = {
 
 def log(msg): print(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-# ---------------- 代碼清單（上市/上櫃） ----------------
+# ---------- 代碼清單（上市/上櫃） ----------
 def fetch_tw_tickers(retries=3, sleep_sec=2) -> pd.DataFrame:
     urls = [
         "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2",  # 上市
@@ -27,7 +34,7 @@ def fetch_tw_tickers(retries=3, sleep_sec=2) -> pd.DataFrame:
         for _ in range(retries):
             try:
                 html = requests.get(u, headers=HEADERS, timeout=30).text
-                # 先用 lxml，失敗再用 bs4/html5lib
+                # lxml -> bs4/html5lib
                 try:
                     tables = pd.read_html(html)
                 except Exception:
@@ -37,36 +44,28 @@ def fetch_tw_tickers(retries=3, sleep_sec=2) -> pd.DataFrame:
             except Exception as e:
                 log(f"WARN 代碼來源失敗一次：{u} ({e})"); time.sleep(sleep_sec)
         if not ok: log(f"WARN 放棄該來源：{u}")
-
     if not frames:
         return pd.DataFrame(columns=["code","name","market","yahoo"])
-
     df = pd.concat(frames, ignore_index=True)
     df.columns = df.iloc[0].tolist()
     df = df.iloc[1:].reset_index(drop=True)
-
     code_name_col = next((c for c in df.columns if "代號" in str(c)), None)
     market_col    = next((c for c in df.columns if "市場別" in str(c)), None)
     if not code_name_col or not market_col:
         log("ERROR 找不到必要欄位（代號/市場別）")
         return pd.DataFrame(columns=["code","name","market","yahoo"])
-
     parsed = df[code_name_col].astype(str).str.extract(r"^(\d{4,6})\s+(.+)$")
     parsed.columns = ["code","name"]
     out = pd.concat([parsed, df[market_col].rename("market")], axis=1).dropna(subset=["code"])
-    out = out[out["code"].str.match(r"^\d{4}$")]  # 僅 4 位數個股
-
-    def suffix(m): return ".TWO" if "上櫃" in str(m) else ".TW"
-    out["yahoo"] = out["code"] + out["market"].apply(suffix)
+    out = out[out["code"].str.match(r"^\d{4}$")]
+    out["yahoo"] = out["code"] + out["market"].apply(lambda m: ".TWO" if "上櫃" in str(m) else ".TW")
     out = out[["code","name","market","yahoo"]].drop_duplicates()
-
-    # 存一份代碼偵錯檔
     today = dt.date.today().isoformat()
-    out.to_csv(DATA_DIR / f"tickers_{today}.csv", index=False, encoding="utf-8-sig")
+    (DATA_DIR / f"tickers_{today}.csv").write_text(out.to_csv(index=False, encoding="utf-8-sig"))
     log(f"INFO 台股代碼數：{len(out)}")
     return out
 
-# ---------------- yfinance 幫手 ----------------
+# ---------- yfinance ----------
 def pull_fundamentals(ticker: str) -> dict:
     t = yf.Ticker(ticker)
     info, fast = {}, {}
@@ -93,18 +92,11 @@ def pull_fundamentals(ticker: str) -> dict:
     }
 
 def fetch_history_upto(ticker: str, end_date: dt.date, lookback_days: int = 420) -> pd.DataFrame:
-    """抓 end_date(含) 以前的日線，避免抓到未來或空白日。"""
-    end_plus = end_date + dt.timedelta(days=1)  # yfinance end 是不含此日
+    end_plus = end_date + dt.timedelta(days=1)  # yfinance end 不含當日，+1
     start = end_plus - dt.timedelta(days=lookback_days)
     df = yf.download(
-        ticker,
-        start=start.strftime("%Y-%m-%d"),
-        end=end_plus.strftime("%Y-%m-%d"),
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-        threads=False,
-        group_by="ticker",
+        ticker, start=start.strftime("%Y-%m-%d"), end=end_plus.strftime("%Y-%m-%d"),
+        interval="1d", auto_adjust=True, progress=False, threads=False, group_by="ticker"
     )
     if df is None or df.empty: return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
@@ -129,9 +121,8 @@ def compute_snr(df: pd.DataFrame, window_days: int = 120):
     })
     return out
 
-# ---------------- 主流程：最近交易日＋備援 ----------------
+# ---------- fallback ----------
 def use_previous_as_fallback():
-    """抓不到新資料時：沿用 data/ 最新一組 CSV 覆蓋 parquet，讓前端可用。"""
     prev_f = sorted(glob.glob("data/fundamentals_*.csv"))
     prev_s = sorted(glob.glob("data/snr_summary_*.csv"))
     if not prev_f or not prev_s:
@@ -139,89 +130,22 @@ def use_previous_as_fallback():
         return
     fund_csv = prev_f[-1]; snr_csv = prev_s[-1]
     fund_df = pd.read_csv(fund_csv); snr_df = pd.read_csv(snr_csv)
-    # 從檔名取日期
-    try:
-        file_date = os.path.basename(snr_csv).split("_")[-1].replace(".csv","")
-    except Exception:
-        file_date = dt.date.today().isoformat()
+    file_date = os.path.basename(snr_csv).split("_")[-1].replace(".csv","")
     fund_df["asOfDate"] = file_date
     snr_df["asOfDate"] = file_date
     try:
         fund_df.to_parquet(DATA_DIR / "fundamentals.parquet", index=False)
         snr_df.to_parquet(DATA_DIR / "snr_summary.parquet", index=False)
     except Exception as e:
-        log(f"WARN 無法寫 parquet：{e}（沿用 CSV 即可）")
+        log(f"WARN 無法寫 parquet：{e}")
     log(f"OK 使用上一版覆蓋 parquet：{file_date}（fund={len(fund_df)}、snr={len(snr_df)}）")
 
+# ---------- 主流程 ----------
 def main():
     tickers_df = fetch_tw_tickers()
     if tickers_df.empty or len(tickers_df) < 100:
         log("ERROR 代碼清單為空或過少；改用上一版資料做備援。")
         return use_previous_as_fallback()
-
     tickers = tickers_df["yahoo"].tolist()
 
     # 基本面
-    fund_rows = []
-    for i, t in enumerate(tickers, 1):
-        try: fund_rows.append(pull_fundamentals(t))
-        except Exception as e: log(f"WARN fundamentals {t} 失敗：{e}")
-        if i % 60 == 0: time.sleep(1)
-    fund_df = pd.DataFrame(fund_rows)
-    if fund_df.empty:
-        log("ERROR 基本面為空；改用上一版資料做備援。")
-        return use_previous_as_fallback()
-
-    # SNR + 最近交易日
-    snr_rows, last_dates = [], []
-    today = dt.date.today()
-    for i, t in enumerate(tickers, 1):
-        try:
-            hist = fetch_history_upto(t, end_date=today, lookback_days=420)
-            if hist.empty: 
-                continue
-            last_dt = pd.to_datetime(hist["Date"].iloc[-1]).date()
-            last_dates.append(last_dt)
-            snr = compute_snr(hist, 120)
-            if snr is None or snr.dropna().empty:
-                continue
-            last = snr.dropna(subset=["Close"]).iloc[-1]
-            snr_rows.append({
-                "Ticker": t,
-                "LastDate": pd.to_datetime(last["Date"]).date(),
-                "Close": float(last["Close"]),
-                "S": float(last["S"]) if pd.notna(last["S"]) else None,
-                "N": float(last["N"]) if pd.notna(last["N"]) else None,
-                "R": float(last["R"]) if pd.notna(last["R"]) else None,
-            })
-        except Exception as e:
-            log(f"WARN snr {t} 失敗：{e}")
-        if i % 50 == 0: time.sleep(1)
-
-    if not last_dates or not snr_rows:
-        log("ERROR 今天抓不到任何 SNR/歷史日線；改用上一版資料做備援。")
-        return use_previous_as_fallback()
-
-    file_date = max(last_dates).isoformat()   # 最近交易日
-    log(f"INFO 最近交易日：{file_date}")
-
-    # 寫檔（覆蓋 parquet、另存對應日期 csv）
-    fund_df["asOfDate"] = file_date
-    try:
-        fund_df.to_parquet(DATA_DIR / "fundamentals.parquet", index=False)
-    except Exception as e:
-        log(f"WARN 無法寫 fundamentals.parquet：{e}")
-    fund_df.to_csv(DATA_DIR / f"fundamentals_{file_date}.csv", index=False, encoding="utf-8-sig")
-    log(f"OK fundamentals：{len(fund_df)} 列")
-
-    snr_df = pd.DataFrame(snr_rows)
-    snr_df["asOfDate"] = file_date
-    try:
-        snr_df.to_parquet(DATA_DIR / "snr_summary.parquet", index=False)
-    except Exception as e:
-        log(f"WARN 無法寫 snr_summary.parquet：{e}")
-    snr_df.to_csv(DATA_DIR / f"snr_summary_{file_date}.csv", index=False, encoding="utf-8-sig")
-    log(f"OK snr_summary：{len(snr_df)} 列")
-
-if __name__ == "__main__":
-    main()
